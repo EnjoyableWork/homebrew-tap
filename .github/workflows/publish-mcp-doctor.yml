@@ -1,0 +1,221 @@
+name: Publish verified mcp-doctor formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable mcp-doctor release version without the v prefix
+        required: true
+        default: 0.1.0
+        type: string
+      mode:
+        description: Rehearse without writes or publish the next verified formula
+        required: true
+        default: rehearse
+        type: choice
+        options:
+          - rehearse
+          - publish
+
+permissions: {}
+
+concurrency:
+  group: publish-mcp-doctor-formula
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Verify immutable upstream formula bytes
+    if: github.repository == 'EnjoyableWork/homebrew-tap'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: read
+      contents: read
+    outputs:
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+      tap_commit: ${{ steps.contract.outputs.tap_commit }}
+
+    steps:
+      - name: Check out the controlled tap branch without write credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate the tap-owned invocation
+        id: contract
+        env:
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "mcp-doctor formula publication must run from tap main" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "mcp-doctor formula requires a canonical stable version" >&2
+            exit 1
+          fi
+          case "$MODE" in
+            rehearse)
+              test "$RELEASE_VERSION" = 0.1.0
+              ;;
+            publish)
+              test "$RELEASE_VERSION" != 0.1.0
+              ;;
+            *)
+              echo "tap mode must be rehearse or publish" >&2
+              exit 1
+              ;;
+          esac
+          printf 'tap_commit=%s\n' "$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+
+      - name: Download and authenticate the exact immutable source handoff
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          release_tag="v$RELEASE_VERSION"
+          mkdir -p candidate
+
+          gh api "repos/EnjoyableWork/mcp-doctor/releases/tags/$release_tag" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' >candidate/release.json
+          gh api "repos/EnjoyableWork/mcp-doctor/git/ref/tags/$release_tag" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' >candidate/tag-ref.json
+          tag_object="$(jq -r '.object.sha' candidate/tag-ref.json)"
+          gh api "repos/EnjoyableWork/mcp-doctor/git/tags/$tag_object" \
+            -H 'X-GitHub-Api-Version: 2026-03-10' >candidate/annotated-tag.json
+          release_commit="$(jq -r '.object.sha' candidate/annotated-tag.json)"
+
+          gh release download "$release_tag" \
+            --repo EnjoyableWork/mcp-doctor \
+            --pattern SHA256SUMS \
+            --pattern "mcp-doctor-$RELEASE_VERSION.crate" \
+            --pattern mcp-doctor.rb \
+            --dir candidate
+          gh release verify "$release_tag" \
+            --repo EnjoyableWork/mcp-doctor \
+            --format json >/dev/null
+          for release_asset in \
+            candidate/SHA256SUMS \
+            "candidate/mcp-doctor-$RELEASE_VERSION.crate" \
+            candidate/mcp-doctor.rb; do
+            gh attestation verify "$release_asset" \
+              --repo EnjoyableWork/mcp-doctor \
+              --signer-workflow EnjoyableWork/mcp-doctor/.github/workflows/release.yml \
+              --source-ref "refs/tags/$release_tag" \
+              --source-digest "$release_commit" \
+              --format json >/dev/null
+          done
+          printf '%s\n' "$release_commit" >candidate/provenance-verified
+
+          verified_commit="$(
+            scripts/verify-mcp-doctor-release.sh \
+              candidate \
+              "$RELEASE_VERSION" \
+              "$MODE" \
+              Formula/mcp-doctor.rb
+          )"
+          test "$verified_commit" = "$release_commit"
+          printf 'release_commit=%s\n' "$release_commit" >>"$GITHUB_OUTPUT"
+
+      - name: Require unsafe handoffs to fail closed
+        env:
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          expect_rejection() {
+            local description=$1
+            local fixture=$2
+            if scripts/verify-mcp-doctor-release.sh \
+              "$fixture" \
+              "$RELEASE_VERSION" \
+              "$MODE" \
+              Formula/mcp-doctor.rb >/dev/null 2>&1; then
+              echo "tap verifier accepted $description" >&2
+              exit 1
+            fi
+          }
+
+          cp -R candidate bad-formula
+          printf '# mismatched formula\n' >>bad-formula/mcp-doctor.rb
+          expect_rejection "mismatched formula bytes" bad-formula
+
+          cp -R candidate bad-provenance
+          printf '%040d\n' 0 >bad-provenance/provenance-verified
+          expect_rejection "mismatched provenance identity" bad-provenance
+
+          cp -R candidate mutable-release
+          jq '.immutable = false' \
+            mutable-release/release.json >mutable-release/release-updated.json
+          mv mutable-release/release-updated.json mutable-release/release.json
+          expect_rejection "a mutable upstream release" mutable-release
+
+      - name: Retain only the verified candidate briefly
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-doctor-formula-${{ inputs.version }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Copy only the exact verified formula
+    if: inputs.mode == 'publish'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: release
+      url: https://github.com/EnjoyableWork/homebrew-tap/blob/main/Formula/mcp-doctor.rb
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the exact verified tap commit with short-lived authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.tap_commit }}
+
+      - name: Download the verified candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mcp-doctor-formula-${{ inputs.version }}
+          path: candidate
+
+      - name: Re-verify and copy only the exact formula
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          TAP_COMMIT: ${{ needs.validate.outputs.tap_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TAP_COMMIT"
+          verified_commit="$(
+            scripts/verify-mcp-doctor-release.sh \
+              candidate \
+              "$RELEASE_VERSION" \
+              publish \
+              Formula/mcp-doctor.rb
+          )"
+          test "$verified_commit" = "$RELEASE_COMMIT"
+
+          install -m 0644 candidate/mcp-doctor.rb Formula/mcp-doctor.rb
+          changed_paths="$(git diff --name-only)"
+          if [[ "$changed_paths" != Formula/mcp-doctor.rb ]]; then
+            echo "tap update changed a path outside Formula/mcp-doctor.rb" >&2
+            exit 1
+          fi
+
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add -- Formula/mcp-doctor.rb
+          staged_paths="$(git diff --cached --name-only)"
+          test "$staged_paths" = Formula/mcp-doctor.rb
+          git commit -m "chore(homebrew): publish mcp-doctor $RELEASE_VERSION"
+          git push origin HEAD:main
