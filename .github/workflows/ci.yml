@@ -1,0 +1,40 @@
+name: Tap policy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tap-policy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Formula publication policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the tap without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify shell and formula syntax
+        run: |
+          set -euo pipefail
+          bash -n scripts/verify-mcp-doctor-release.sh
+          bash -n scripts/verify-mcp-sync-release.sh
+          bash -n scripts/stage-mcp-sync-formula.sh
+          bash -n scripts/test-mcp-sync-release-policy.sh
+          shellcheck scripts/*.sh
+          ruby -c Formula/mcp-doctor.rb
+          ruby -c Formula/mcp-sync.rb
+
+      - name: Exercise deterministic mcp-sync publication policy
+        run: ./scripts/test-mcp-sync-release-policy.sh

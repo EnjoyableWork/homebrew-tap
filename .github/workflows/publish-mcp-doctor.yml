@@ -20,7 +20,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: publish-mcp-doctor-formula
+  group: homebrew-tap-release
   cancel-in-progress: false
 
 jobs:
