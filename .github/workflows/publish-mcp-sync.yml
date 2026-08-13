@@ -1,0 +1,345 @@
+name: Publish verified mcp-sync formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Immutable mcp-sync release version without the v prefix
+        required: true
+        default: 0.1.1
+        type: string
+      mode:
+        description: Rehearse the current no-op or publish the next verified formula
+        required: true
+        default: rehearse
+        type: choice
+        options:
+          - rehearse
+          - publish
+
+permissions: {}
+
+concurrency:
+  group: homebrew-tap-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Verify immutable upstream and tap transition without write authority
+    if: github.repository == 'EnjoyableWork/homebrew-tap'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: read
+      contents: read
+    outputs:
+      decision: ${{ steps.verify.outputs.decision }}
+      release_commit: ${{ steps.verify.outputs.release_commit }}
+      tap_commit: ${{ steps.contract.outputs.tap_commit }}
+
+    steps:
+      - name: Check out the exact tap dispatch commit without write credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate the exact tap-owned dispatch ref
+        id: contract
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_REF_TYPE: ${{ github.ref_type }}
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          TAP_COMMIT: ${{ github.sha }}
+          WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          stable_version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$DISPATCH_REF" != refs/heads/main ]] ||
+            [[ "$DISPATCH_REF_TYPE" != branch ]] ||
+            [[ "$WORKFLOW_COMMIT" != "$TAP_COMMIT" ]]; then
+            echo "mcp-sync formula publication must use the exact tap main workflow and commit" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_VERSION" =~ $stable_version_pattern ]]; then
+            echo "mcp-sync formula publication requires a canonical stable version" >&2
+            exit 1
+          fi
+          case "$MODE" in
+            rehearse | publish) ;;
+            *)
+              echo "tap mode must be rehearse or publish" >&2
+              exit 1
+              ;;
+          esac
+          test "$(git rev-parse HEAD)" = "$TAP_COMMIT"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf 'tap_commit=%s\n' "$TAP_COMMIT" >>"$GITHUB_OUTPUT"
+
+      - name: Download and authenticate the complete upstream handoff
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          handoff="$RUNNER_TEMP/handoff"
+          candidate="$handoff/candidate"
+          prior="$handoff/prior"
+          mkdir -p "$candidate/assets" "$prior/assets"
+
+          sha256_file() {
+            sha256sum "$1" | awk '{ print tolower($1) }'
+          }
+
+          release_identity() {
+            local version=$1
+            local destination=$2
+            local tag="v$version"
+            local tag_object
+
+            gh api "repos/EnjoyableWork/mcp-sync/releases/tags/$tag" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' >"$destination/release.json"
+            gh api "repos/EnjoyableWork/mcp-sync/git/ref/tags/$tag" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' >"$destination/tag-ref.json"
+            tag_object="$(jq -r '.object.sha' "$destination/tag-ref.json")"
+            gh api "repos/EnjoyableWork/mcp-sync/git/tags/$tag_object" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' >"$destination/annotated-tag.json"
+          }
+
+          verify_attestations() {
+            local version=$1
+            local destination=$2
+            shift 2
+            local tag="v$version"
+            local release_commit marker_assets release_asset
+
+            release_commit="$(jq -r '.object.sha' "$destination/annotated-tag.json")"
+            gh release verify "$tag" \
+              --repo EnjoyableWork/mcp-sync \
+              --format json >/dev/null
+            for release_asset in "$@"; do
+              gh attestation verify "$release_asset" \
+                --repo EnjoyableWork/mcp-sync \
+                --signer-workflow EnjoyableWork/mcp-sync/.github/workflows/source-linux-release.yml \
+                --source-ref "refs/tags/$tag" \
+                --source-digest "$release_commit" \
+                --format json >/dev/null
+            done
+            marker_assets="$({
+              for release_asset in "$@"; do
+                jq -n \
+                  --arg name "$(basename -- "$release_asset")" \
+                  --arg sha256 "$(sha256_file "$release_asset")" \
+                  '{name: $name, sha256: $sha256}'
+              done
+            } | jq -s 'sort_by(.name)')"
+            jq -n \
+              --arg digest "$release_commit" \
+              --arg ref "refs/tags/$tag" \
+              --argjson assets "$marker_assets" \
+              '{
+                schema: "mcp-sync.tap-attestations/v1",
+                source_repository: "EnjoyableWork/mcp-sync",
+                source_workflow: "EnjoyableWork/mcp-sync/.github/workflows/source-linux-release.yml",
+                source_ref: $ref,
+                source_digest: $digest,
+                release_verified: true,
+                assets: $assets
+              }' >"$destination/attestations.json"
+          }
+
+          release_identity "$RELEASE_VERSION" "$candidate"
+          gh release download "v$RELEASE_VERSION" \
+            --repo EnjoyableWork/mcp-sync \
+            --dir "$candidate/assets"
+          verify_attestations \
+            "$RELEASE_VERSION" \
+            "$candidate" \
+            "$candidate/assets/SHA256SUMS" \
+            "$candidate/assets/enjoyable-mcp-sync-$RELEASE_VERSION.crate" \
+            "$candidate/assets/mcp-sync-v$RELEASE_VERSION-aarch64-unknown-linux-gnu.spdx.json" \
+            "$candidate/assets/mcp-sync-v$RELEASE_VERSION-aarch64-unknown-linux-gnu.tar.gz" \
+            "$candidate/assets/mcp-sync-v$RELEASE_VERSION-x86_64-unknown-linux-gnu.spdx.json" \
+            "$candidate/assets/mcp-sync-v$RELEASE_VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+            "$candidate/assets/mcp-sync.rb"
+
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 60 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --header 'User-Agent: homebrew-tap-mcp-sync-publisher/0.1 (+https://github.com/EnjoyableWork/homebrew-tap)' \
+            --output "$candidate/registry.json" \
+            'https://crates.io/api/v1/crates/enjoyable-mcp-sync'
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --header 'User-Agent: homebrew-tap-mcp-sync-publisher/0.1 (+https://github.com/EnjoyableWork/homebrew-tap)' \
+            --output "$candidate/registry.crate" \
+            "https://crates.io/api/v1/crates/enjoyable-mcp-sync/$RELEASE_VERSION/download"
+
+          current_version="$(
+            sed -n \
+              's#^  url "https://github.com/EnjoyableWork/mcp-sync/releases/download/v\([0-9][0-9.]*\)/enjoyable-mcp-sync-[0-9][0-9.]*\.crate"$#\1#p' \
+              Formula/mcp-sync.rb
+          )"
+          if [[ ! "$current_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "current mcp-sync formula version could not be determined safely" >&2
+            exit 1
+          fi
+          release_identity "$current_version" "$prior"
+          gh release download "v$current_version" \
+            --repo EnjoyableWork/mcp-sync \
+            --pattern SHA256SUMS \
+            --pattern mcp-sync.rb \
+            --dir "$prior/assets"
+          verify_attestations \
+            "$current_version" \
+            "$prior" \
+            "$prior/assets/SHA256SUMS" \
+            "$prior/assets/mcp-sync.rb"
+
+          verification="$(
+            scripts/verify-mcp-sync-release.sh \
+              "$handoff" \
+              "$RELEASE_VERSION" \
+              "$MODE" \
+              Formula/mcp-sync.rb
+          )"
+          read -r decision release_commit unexpected <<<"$verification"
+          if [[ -n "${unexpected:-}" ]] ||
+            [[ "$decision" != "$MODE" && ! ( "$MODE" == rehearse && "$decision" == noop ) ]]; then
+            echo "mcp-sync tap verifier returned an unexpected decision" >&2
+            exit 1
+          fi
+          printf 'decision=%s\n' "$decision" >>"$GITHUB_OUTPUT"
+          printf 'release_commit=%s\n' "$release_commit" >>"$GITHUB_OUTPUT"
+
+      - name: Retain only the independently verified handoff briefly
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-sync-formula-${{ inputs.version }}
+          path: ${{ runner.temp }}/handoff
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+
+  rehearse:
+    name: Prove the protected v0.1.1 no-write no-op
+    if: inputs.mode == 'rehearse'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: release
+      url: https://github.com/EnjoyableWork/homebrew-tap/blob/main/Formula/mcp-sync.rb
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Check out the exact verified tap commit without write credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.validate.outputs.tap_commit }}
+
+      - name: Download the verified handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mcp-sync-formula-${{ inputs.version }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Re-verify the exact no-op without mutation
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          TAP_COMMIT: ${{ needs.validate.outputs.tap_commit }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_VERSION" = 0.1.1
+          test "$(git rev-parse HEAD)" = "$TAP_COMMIT"
+          formula_before="$(sha256sum Formula/mcp-sync.rb | awk '{ print $1 }')"
+          verification="$(
+            scripts/verify-mcp-sync-release.sh \
+              "$RUNNER_TEMP/handoff" \
+              "$RELEASE_VERSION" \
+              rehearse \
+              Formula/mcp-sync.rb
+          )"
+          test "$verification" = "noop $RELEASE_COMMIT"
+          test "$(sha256sum Formula/mcp-sync.rb | awk '{ print $1 }')" = "$formula_before"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          git diff --exit-code
+          printf '%s\n' \
+            'Protected rehearsal revalidated immutable v0.1.1 and made no tap change.' \
+            >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Copy only Formula/mcp-sync.rb with the tap job token
+    if: inputs.mode == 'publish'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: release
+      url: https://github.com/EnjoyableWork/homebrew-tap/blob/main/Formula/mcp-sync.rb
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the exact verified tap commit with only the job token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+          ref: ${{ needs.validate.outputs.tap_commit }}
+
+      - name: Download the verified handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mcp-sync-formula-${{ inputs.version }}
+          path: ${{ runner.temp }}/handoff
+
+      - name: Re-verify, stage, and publish only the mcp-sync formula
+        env:
+          RELEASE_COMMIT: ${{ needs.validate.outputs.release_commit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          TAP_COMMIT: ${{ needs.validate.outputs.tap_commit }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TAP_COMMIT"
+          test "$(git ls-remote origin refs/heads/main | awk '{ print $1 }')" = "$TAP_COMMIT"
+          verification="$(
+            scripts/verify-mcp-sync-release.sh \
+              "$RUNNER_TEMP/handoff" \
+              "$RELEASE_VERSION" \
+              publish \
+              Formula/mcp-sync.rb
+          )"
+          test "$verification" = "publish $RELEASE_COMMIT"
+
+          scripts/stage-mcp-sync-formula.sh \
+            . \
+            "$RUNNER_TEMP/handoff/candidate/assets/mcp-sync.rb" \
+            "$TAP_COMMIT" >/dev/null
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore(homebrew): publish mcp-sync $RELEASE_VERSION"
+          test "$(git rev-parse HEAD^)" = "$TAP_COMMIT"
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = Formula/mcp-sync.rb
+          git diff HEAD^ HEAD --exit-code -- Formula/mcp-doctor.rb
+          test "$(git ls-remote origin refs/heads/main | awk '{ print $1 }')" = "$TAP_COMMIT"
+          git push origin HEAD:refs/heads/main
+          published_commit="$(git rev-parse HEAD)"
+          test "$(git ls-remote origin refs/heads/main | awk '{ print $1 }')" = "$published_commit"
+
+          {
+            echo '## mcp-sync Homebrew formula publication'
+            echo
+            echo "- Version: \`$RELEASE_VERSION\`"
+            echo "- Immutable release commit: \`$RELEASE_COMMIT\`"
+            echo "- Tap base commit: \`$TAP_COMMIT\`"
+            echo "- Tap formula commit: \`$published_commit\`"
+            echo "- Changed path: \`Formula/mcp-sync.rb\` only"
+            echo "- Authority: this job-scoped tap \`GITHUB_TOKEN\` only"
+          } >>"$GITHUB_STEP_SUMMARY"
