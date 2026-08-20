@@ -4,8 +4,8 @@
 class McpDoctor < Formula
   desc "Diagnose protocol, schema, and runtime failures in MCP servers"
   homepage "https://github.com/EnjoyableWork/mcp-doctor"
-  url "https://github.com/EnjoyableWork/mcp-doctor/releases/download/v0.3.3/mcp-doctor-0.3.3.crate"
-  sha256 "a6fc434131ab109d7e9bf85e8cdff17cad34590c2a65ee4bf91578eb4310b4ec"
+  url "https://github.com/EnjoyableWork/mcp-doctor/releases/download/v0.4.0/mcp-doctor-0.4.0.crate"
+  sha256 "b87aff88710cce5a8d4d42b8429041bdda2dd51485c80910808312a0b0e035fe"
   license "MIT"
 
   depends_on "rust" => :build
